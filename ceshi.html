@@ -1,0 +1,317 @@
+# 题 1.9 详细解答：ESM vs CJS 模块化与 tree-shaking 前提
+
+> 对应题库 1.9「ESM vs CJS 与 tree-shaking 前提」。本文按单题详解体例组织：核心认知 → 语义差异 → 循环依赖 → tree-shaking → interop 与工程配置 → 经典题推演 → 扣分红线 → 追问详解，附答题模板与配套评分参考。
+
+## 一、核心认知：两套模块系统差在哪一层
+
+一句话分水岭：
+
+> **CJS 是运行时的、动态的、值拷贝的模块系统；ESM 是编译期的、静态的、活绑定的模块系统。** "静态"这一条是后面所有差异（提升、TDZ、tree-shaking、按需加载）的总根源。
+
+| 维度 | CJS（CommonJS） | ESM（ES Modules） |
+|---|---|---|
+| 本质 | `require()` 函数调用 + `module.exports` 对象 | 语言级语法（import/export），引擎编译期解析 |
+| 加载 | **同步**执行，阻塞到模块加载、编译、求值完毕 | 解析（Parse）→ 实例化（Instantiate，建绑定）→ 求值（Evaluate）三阶段，浏览器可并行/预解析 |
+| 导出形态 | 给 `module.exports` 对象挂属性（**值拷贝**） | 导出的是**绑定**（变量名的活引用，live binding） |
+| 求值次数 | 模块缓存（`require.cache`），一次求值 | 模块实例全图唯一，一次求值（含循环依赖也只求值一次） |
+| 动态性 | `require()` 可写在任何位置、可条件调用、路径可拼接 | `import` 必须顶层静态；动态场景用 `import()` |
+| 严格模式 | 默认非严格 | **强制严格模式** |
+| 顶层 `this` | `=== exports`（初始引用） | `undefined` |
+| 运行环境 | Node / 打包器 | 浏览器原生 + Node（`.mjs` 或 `type: "module"`） |
+
+物理图景：
+
+- CJS：模块被包成 `function (exports, require, module, __filename, __dirname) { ... }` 由 Node **调用**（这就是"运行时"的含义），`require` 返回 `module.exports` 的引用。
+- ESM：每个模块是一条 **Module Record**（含 import/export 条目表），实例化阶段把 import 的名字和 export 的名字在环境记录里**连成一条链**；读写走的都是同一个变量，不存在"拷贝"。
+
+## 二、语义差异逐条拆解
+
+### 1. 提升与求值时机
+
+- `import` 声明会被**提升**到模块顶部：无论写在文件第几行，依赖模块都最先求值，import 语句本身不能被条件/try 包裹执行。
+- `require()` 就是普通函数调用：可以写在 `if` 里、循环里、函数里，执行到才加载。
+- ESM 求值顺序：深度优先，按 import 声明顺序实例化整个模块图，然后从入口开始求值；CJS 是"走到哪 require 到哪"的深度递归。
+
+### 2. 活绑定（live binding）—— 最高频考点
+
+ESM 导出的是**变量绑定**，导出方修改变量后，导入方立即看到新值；CJS 导出的是**属性值的拷贝**，导出后再改源变量，导入方拿的还是旧值。
+
+```js
+// === ESM：counter.mjs ===
+export let count = 0;
+export function inc() { count++; }
+
+// === main.mjs ===
+import { count, inc } from './counter.mjs';
+console.log(count); // 0
+inc();
+console.log(count); // 1 ← 活绑定，看到的是同一个变量
+```
+
+```js
+// === CJS：counter.js ===
+let count = 0;
+function inc() { count++; }
+module.exports = { count, inc };   // 导出瞬间 count 的值 0 被拷进对象
+
+// === main.js ===
+const { count, inc } = require('./counter.js');
+console.log(count); // 0
+inc();
+console.log(count); // 0 ← 解构出来的是值拷贝，源变量变了也看不见
+```
+
+注意两层拷贝：`module.exports = { count }` 在构造对象时拷贝一次，解构 `const { count } = require(...)` 又拷贝一次。CJS 想"模拟活绑定"只能导出 getter（`get count() { return count }`）或导出可变容器（`exports.state = { count: 0 }`）。
+
+### 3. 严格模式与顶层 this
+
+- ESM 全程严格：未声明变量赋值抛 `ReferenceError`、`this` 为 `undefined`、`arguments`/`callee` 受限。
+- CJS 非严格：顶层 `this === exports`（初始引用），隐式全局会真的挂到 `global`。
+
+### 4. 静态结构的两面性
+
+ESM 的 import/export 必须是顶层静态语法，代价是"不能随便动态拼路径"，收益是：
+
+1. **可静态分析**：不运行代码就知道模块图 → 摇树、代码分割、预加载、类型检查全靠它；
+2. **异步加载友好**：浏览器能并行拉取、预解析（`<link rel="modulepreload">`），Node ESM 加载不阻塞主线程；
+3. **循环依赖可判定**：绑定关系编译期确定（见第三章）。
+
+需要动态性的三个出口：`import()`（返回 Promise，运行时决定）、`import.meta.url`（模块自身 URL，替代 `__filename`）、顶层 `await`（TLA，ESM 独有，会推迟整个模块图的求值）。
+
+## 三、循环依赖的两种结局
+
+### CJS：拿到"半成品" exports
+
+`require` 的缓存机制是"**先占坑，后填肉**"：模块开始执行前就把 `module.exports`（初始 `{}`）放进 `require.cache`，递归 require 回到自己时，拿到的是**执行了一半的 exports 对象**——可能缺属性，但不会抛错。
+
+```js
+// a.js
+exports.a = 1;
+const b = require('./b.js');     // 触发 b 求值
+console.log('a sees b:', b.b);   // b 求值中又 require('./a.js') 拿到 { a: 1 } 半成品
+exports.a = 2;
+
+// b.js
+const a = require('./a.js');     // 拿到半成品 { a: 1 }，此刻没有报错
+console.log('b sees a:', a.a);   // 1
+exports.b = 'from-b';
+```
+
+输出：`b sees a: 1` → `a sees b: from-b`。隐蔽点：b 拿到的 `a.a` 是 **1**（require 时刻的值拷贝），之后 a.js 把 `a` 改成 2 也不影响 b。如果 require 拿的是**还没赋值的导出**（如 `exports` 里只有函数声明后才有的东西），就是 `undefined`——**不报错，静默 undefined**，这是 CJS 循环依赖事故高发的根因。
+
+### ESM：绑定已连好，但访问时机决定死法
+
+实例化阶段**所有绑定先连好**（import 名指向 export 方的变量），求值阶段才执行代码。于是：
+
+- **访问函数声明（hoisted）**：安全。函数声明在求值前就已初始化。
+- **访问 `let`/`const`/`class` 的未初始化绑定**：抛 **`ReferenceError: Cannot access 'x' before initialization`**（TDZ）——ESM 循环依赖是"响亮地死"，比 CJS 的静默 undefined 好排查。
+
+```js
+// a.mjs
+import { b } from './b.mjs';
+export const a = 'a-value';
+export function getB() { return b; }   // 函数体内访问：求值时 b 已初始化 → 安全
+
+// b.mjs
+import { a } from './a.mjs';
+export const b = 'b-value';
+console.log(a);   // ❌ 此刻 a.mjs 尚未求值完，a 处于 TDZ → ReferenceError
+// 若把上面这行改成函数体内延迟访问（getA(){ return a; }），即可解开
+```
+
+**面试结论**：循环依赖最好直接消除（提取共享模块、依赖倒置、事件/回调注入）；临时手段：CJS 靠"延迟 require（函数内 require）"，ESM 靠"只在函数体内访问对方绑定 + 优先依赖函数声明"。
+
+## 四、tree-shaking：为什么只有 ESM 能摇树
+
+### 原理
+
+打包器（Rollup 原始模型）拿到**静态模块图**后：
+
+1. 从入口出发，标记所有**被引用到的导出**（used exports）；
+2. 没被任何模块引用的导出 → 标记为不可达；
+3. 压缩器（terser/esbuild）在产出阶段**真正删除**这些不可达代码（webpack 5 的 `optimization.usedExports` 只做标记，删除靠 minimizer）。
+
+CJS 做不到的原因：`require('./x')` 的路径可以是变量、`exports` 可以被任意赋值、导出集合**运行时才知道**——静态分析无法证明"哪个导出没被用"，只能整模块保留。
+
+### tree-shaking 生效的全部前提
+
+1. **源码是 ESM 静态 import/export**，且依赖包也提供 ESM 构建（或源码本身是 ESM）；
+2. **未使用的导出是"纯"的**：模块顶层无副作用（赋值全局、注册监听、`console.log`、polyfill 注入都算副作用）；库作者用 `"sideEffects": false`（或数组白名单 `["*.css"]`）声明，webpack 才敢整文件丢弃；
+3. **生产构建 + 压缩**：dev 模式 webpack 不删、不压，"摇完也看不出来"；
+4. **没有把 ESM 转成 CJS**：Babel 必须配 `modules: false`（或 `@babel/preset-env` 不转模块），否则 `import` 变 `require`，前功尽弃；
+5. **导入姿势正确**：`import { map } from 'lodash-es'` 可摇，`import _ from 'lodash'`（CJS 包）或 `import * as _ from 'x'` 后 `_[name]` 动态取值不可摇；
+6. **不要动态访问导出**：`mod[key]`、`export * from` 大杂烩、re-export 全集会把可达性分析打回保守。
+
+### 常见失效清单（工程高频）
+
+| 失效原因 | 说明 |
+|---|---|
+| Babel/TS 转出 CJS | `modules: false`、TS `module: "esnext"` + bundler 处理 |
+| 依赖包只有 CJS 产物 | 换 ESM 版本（lodash-es、echarts 按需）或等价物 |
+| 副作用未声明/真实存在 | `sideEffects` 缺失 → 打包器保守保留；polyfill 类包天然带副作用 |
+| 默认导出整体引入 | `import utils from './utils'` 一个大对象，无法拆 |
+| 动态属性访问 | `utils[name]()` 使全部导出变"可能被用" |
+| dev 构建看效果 | 生产 + minify 才能看到删除结果 |
+
+验证方法：`webpack-bundle-analyzer` / `rollup-plugin-visualizer` 看产物构成；`npx source-map-explorer`；构建日志里 webpack 会标注 `unused harmony export`。
+
+## 五、Interop、双包问题与 exports 字段
+
+### 1. default 导入的互操作差异（经典坑）
+
+- **CJS 的 `module.exports` 在 ESM 里的样子**：`import foo from 'cjs-pkg'` → `foo` **就是 `module.exports` 整体**；具名导入 `import { a } from 'cjs-pkg'` 由 Node/打包器对静态分析出的 `exports.a` 做模拟（CJS 没有真具名导出）。
+- **ESM 的 `export default` 在 CJS 里的样子**：`require('esm-pkg')` 得到 `{ default: ... }` 包装对象，**不是**默认导出值本身 → 需要 `pkg.default ?? pkg`（Babel 产物里就是 `_interopRequireDefault`）。
+- 术语：`esModuleInterop`（TS）、`__esModule` 标记（Babel 打的）、`_interopRequireDefault` / `_interopRequireWildcard`——面试答出"__esModule 标记 + interop helper 区分 default"即优秀档锚点。
+
+### 2. 双包问题（dual package hazard）
+
+同一包同时发 ESM（`module`/`import`）和 CJS（`main`/`require`）两份产物时：
+
+- 依赖它的 ESM 代码走 ESM 实例、CJS 代码走 CJS 实例 → **两份独立模块实例**；
+- 后果：单例失效（两个 store/两个缓存）、`instanceof` 跨产物失败、共享状态（注册表、插件表）分裂。
+- 防御：① 只发一种格式（pure ESM 或 pure CJS）；② 两份产物共享状态放 `globalThis`；③ `exports` 字段把内部文件封死，强制统一入口；④ 用同一份 ESM 源 + 运行时薄包装而非两套构建产物。
+
+### 3. package.json 三个入口字段
+
+```json
+{
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.mjs",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.cjs",
+      "default": "./dist/index.mjs"
+    },
+    "./plugins/*": "./dist/plugins/*.mjs",
+    "./package.json": "./package.json"
+  },
+  "sideEffects": false
+}
+```
+
+- `main`：CJS/老工具入口；`module`：打包器专用 ESM 入口（非官方但事实标准）；**`exports`：现代权威入口**，同时提供**封装性**（未列出的子路径 import 直接报错，禁止 `pkg/dist/internal.js`）与**条件解析**（`types` 放最前、`import`/`require`/`node`/`browser`/`default`）。
+- `type: "module"` 让 `.js` 变 ESM，`.cjs`/`.mjs` 显式覆盖；不写 `type` 则 `.js` 是 CJS。
+- 子路径模式 `"./features/*": "./src/features/*.js"`，注意别把内部结构泄漏给消费者（封装性原则）。
+
+### 4. Node ESM 的解析差异与动态 import()
+
+- ESM 相对导入**必须写全扩展名**（`./a.js`，不补 `.js`），路径按 URL 规则解析；`__dirname`/`__filename`/`require`/`require.cache` 都不存在，替代品是 `import.meta.url` + `fileURLToPath`、`import.meta.dirname`（Node 20.11+）。
+- **动态 `import()`**：两套系统通用，返回 `Promise<ModuleNamespace>`，场景：路由/组件懒加载（`React.lazy(() => import('./X'))`）、条件加载（按权限/按设备）、降级加载、把重依赖踢出首包。注意 `import()` 仍是"整模块加载"，被动态 import 的模块**不会被摇掉**，但会成为独立 chunk。
+- **顶层 await（TLA）**：ESM 独占，会推迟本模块及依赖它的模块的求值；库代码慎用（会传染给消费者），应用入口可用。
+- CJS require ESM：传统上不支持（require 是同步、ESM 可能有 TLA）；Node 22 起支持 `require(esm)`（同步加载无 TLA 的 ESM 图），但**浏览器端 require 不存在**，跨端代码仍应以 ESM 为源。
+
+## 六、经典题推演
+
+### 例 1（活绑定 vs 值拷贝，必考）
+
+```js
+// counter.mjs
+export let count = 0;
+export function inc() { count++; }
+
+// a.mjs
+import { count, inc } from './counter.mjs';
+inc();
+console.log('a:', count);        // 1
+
+// b.mjs
+import { count } from './counter.mjs';
+console.log('b:', count);        // 1（同一绑定）
+```
+
+若换成 CJS + `module.exports = { count, inc }`，两处输出都是 0（拷贝）。**推演口诀**：ESM 问"这个变量现在是什么"，CJS 问"require 那一刻是什么"。
+
+### 例 2（import 提升）
+
+```js
+console.log('main start');
+import { a } from './a.mjs';   // 写在后面也无效——提升到最前
+console.log('main end');
+```
+
+输出：先 `a.mjs` 整个求值（含其内部所有 log），再 `main start` → `main end`。import 声明**不是**"执行到才加载"。
+
+### 例 3（CJS 循环依赖输出）
+
+见第三章代码：`b sees a: 1` → `a sees b: from-b`。追问变体：把 `exports.a = 1` 移到 `require('./b.js')` **之后**，则 b 拿到 `a: undefined`（静默 undefined，不抛错）——这正是 CJS 循环依赖的危险形态。
+
+### 例 4（ESM 循环依赖 TDZ）
+
+见第三章代码：求值阶段 b.mjs 顶层 `console.log(a)` → `ReferenceError`。修复：把访问挪进函数体内，等调用时 a 已初始化。
+
+### 例 5（判断题组）
+
+| 说法 | 正误 |
+|---|---|
+| `require()` 可以写在 `if` 里，`import` 不行 | ✅（动态加载用 `import()`） |
+| ESM 默认非严格模式 | ❌（强制严格） |
+| `export default` 在 CJS 里 require 得到的就是导出值 | ❌（`{ default: ... }` 包装） |
+| 只要用了 ESM 就一定 tree-shaking | ❌（还要副作用声明/生产压缩/不转 CJS，见第四章） |
+| ESM 循环依赖一定报错 | ❌（函数声明/延迟访问可以活） |
+| CJS `require` 两次同模块返回同一对象 | ✅（`require.cache`） |
+
+## 七、扣分红线
+
+- ❌ "ESM 是异步的、CJS 是同步的" —— 不准确：CJS require 同步**求值**，ESM 加载与求值也是确定顺序的，差别在"静态解析/绑定"，不是简单的同步异步。
+- ❌ "ESM 导出的是值，CJS 导出的是引用" —— 反了/混了：对象属性永远是引用拷贝，ESM 的特点是**变量绑定活**。
+- ❌ "import 和 require 只是写法不同" —— 忽略静态/动态、活绑定/拷贝、严格模式、循环依赖、tree-shaking 一整串差异。
+- ❌ "tree-shaking 是压缩器做的" / "用 ESM 就自动生效" —— 分不清 usedExports 标记与 minimizer 删除、忽略副作用与 CJS 转译前提。
+- ❌ "循环依赖用 `module.exports = {...}` 一次性整体导出就能全解决" —— 半成品问题依旧，只是换形态。
+- ❌ "双包只是产物多一份，没有实际危害" —— 单例分裂、instanceof 失败是真实事故。
+- ❌ 把 `import()` 说成"异步版 require，加载完自动摇树" —— 动态 import 的模块是独立 chunk，不参与被摇。
+
+## 八、追问详解
+
+**Q1：为什么说 ESM 的导出是"活绑定"？底层怎么实现的？**
+答：模块实例化阶段，引擎在环境记录里把导入方的名字和导出方的**同一个变量槽**连起来（可以理解为编译期确定的间接寻址/指针），读写都落在原变量上；CJS 则是 `module.exports.foo = value` 把值写进对象属性，读取方再从对象取——中间隔了一层值拷贝。锚点词：**Module Record / 环境记录绑定 / 值拷贝 vs 变量引用**。常见错误：说成"ESM 传引用、CJS 传值"。
+
+**Q2：循环依赖 ESM 和 CJS 各会发生什么？哪个更危险？**
+答：CJS 返回半成品 `exports`，缺的属性是**静默 undefined**，埋雷难查；ESM 绑定先连好，函数声明（hoisted）可安全互引，`const/class` 未初始化访问抛 TDZ `ReferenceError`——响亮失败反而更好排查。深度锚点：说出"ESM 实例化/求值两阶段"与"CJS 先占坑后填肉的缓存机制"。共同结论：优先靠设计消除循环（提取共享模块/依赖注入），临时手段 CJS 延迟 require、ESM 函数体内延迟访问。
+
+**Q3：你们项目里 tree-shaking 失效一般怎么排查？**
+答：五步：① 确认产物是生产 + minify；② `webpack-bundle-analyzer`/`rollup-plugin-visualizer` 看目标代码是否在包里；③ 构建日志看 `unused harmony export` 标记（标记了但没删 → minimizer/压缩配置问题）；④ 检查依赖是 CJS 还是 ESM（`lodash` vs `lodash-es`、`import` 姿态是具名还是默认整体）；⑤ 查 Babel/TS 是否把模块转成了 CJS（`modules: false`、TS `module: "esnext"`）。优秀档还会提到 `sideEffects` 标记与副作用真实存在（polyfill、样式注册）的权衡。
+
+**Q4：双包问题（dual package hazard）是什么？怎么防？**
+答：同一包的 ESM/CJS 两份产物被不同格式的消费者分别加载 → **两份模块实例**，单例、全局注册表、`instanceof` 全部分裂。防御：优先只发一种格式（pure ESM 越来越主流）；必须双发时共享状态挂 `globalThis`、用 `exports` 字段封死旁路入口、避免两套构建产物有独立状态。优秀档锚点：举出"两个 store 实例/插件注册两次"的真实后果。
+
+## 附、答题模板与配套评分参考
+
+### 答题模板（面试 3 分钟版）
+
+> CJS 是运行时系统：`require` 同步执行、返回 `module.exports` 对象，导出是**值拷贝**，可条件动态加载，循环依赖会拿到半成品（静默 undefined）；ESM 是编译期系统：import/export 静态语法、实例化阶段建**活绑定**、强制严格模式、顶层 this 为 undefined，import 提升且不能条件执行，动态场景用 `import()`，循环依赖时未初始化的 const/class 是 TDZ 报错。工程上：ESM 的静态结构是 **tree-shaking 的前提**——打包器静态分析出未引用的导出再由压缩器删除，还需要 `sideEffects` 声明、生产构建、Babel `modules: false`、依赖包提供 ESM，缺一不可。互操作注意 default 导入差异（`{ default }` 包装、`__esModule` 标记）、双包问题（同包两份实例导致单例分裂），库发布用 `exports` 字段做条件导出与封装。
+
+### 配套评分参考（对应评分表 1.9）
+
+**三档得分点**
+
+| 档位 | 分数 | 得分点 |
+|---|---|---|
+| 优秀 | 8-10 | 静态/动态、活绑定/值拷贝两条主线说全；循环依赖两种结局（半成品 vs TDZ）能推演输出；tree-shaking 说出**机制 + 失效清单**（副作用、CJS 依赖、Babel 转译、生产压缩）；提 default interop 或双包问题 |
+| 合格 | 5-7 | 知道 require 同步/import 提升、导出缓存 vs 一次性、ESM 便于摇树；细节（活绑定、TDZ、sideEffects）说不全 |
+| 不合格 | 0-4 | 只会背"一个同步一个异步"；认为 import 和 require 等价；tree-shaking 归因于压缩器或"用了就生效" |
+
+**两层追问（含解析）**
+
+- 第一层（边界）：「ESM 循环依赖一定报错吗？」
+  - 期望要点：绑定先连好；函数声明（提升）可安全互引；`const/class` 未初始化访问抛 TDZ ReferenceError；CJS 则是半成品 + 静默 undefined。
+  - 解析：考"实例化/求值两阶段"是否真理解；答"一定报错"或"一定不报错"都不合格档，能举函数体内延迟访问的解法即合格以上。
+- 第二层（工程）：「你们项目 tree-shaking 失效怎么排查？双包问题遇到过吗？」
+  - 期望要点：analyzer 看产物 → 构建日志 unused 标记 → 依赖 CJS/ESM → Babel `modules` → `sideEffects`；双包 = 两份实例、单例/instanceof 分裂、exports 字段统一入口。
+  - 解析：能给出有次序的排查路径 + 一个真实后果（单例分裂）即优秀档锚点；只会背概念不定档到优秀。
+
+**扣分项/红线**
+
+- "import 和 require 只是写法不同"；
+- "ESM 导出的是引用、CJS 导出的是值"（方向说反）；
+- "tree-shaking 是压缩器做的/用 ESM 自动生效"；
+- "循环依赖全靠 `module.exports = {}` 整体导出解决"；
+- "双包没有实际危害"。
+
+### 连问分工说明
+
+- **1.9 vs 7.2（tree-shaking 与产物治理）**：1.9 答"为什么 ESM 才能摇树"的机制与前提清单；7.2 答产物治理实操（bundle 分析、体积预算、sideEffects 实践、CI 卡口）。
+- **1.9 vs 7.1（Vite vs webpack）**：1.9 答模块语义本身；7.1 答打包/开发服务器如何利用 ESM（unbundled dev、esbuild 预构建、依赖优化）。
+- **1.9 vs 2.6（TS 工程治理）**：`module`/`moduleResolution`、`import type`、`esModuleInterop` 归 2.6 的 TS 配置面，1.9 只答语义差异。
